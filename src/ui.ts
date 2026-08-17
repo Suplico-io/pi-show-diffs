@@ -1,10 +1,10 @@
 import type { UserMessage } from "@earendil-works/pi-ai";
-import { BorderedLoader, getMarkdownTheme, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { t } from "./i18n.js";
 import {
     CURSOR_MARKER,
     Editor,
-    Markdown,
+    Input,
     matchesKey,
     truncateToWidth,
     visibleWidth,
@@ -397,6 +397,18 @@ class DiffViewer implements Component {
         }
 
         return lines.join("\n");
+    }
+
+    getSemanticCodeContext(): string | undefined {
+        const hunk = this.getCurrentHunkText();
+        if (!hunk) return undefined;
+
+        const before = this.preview.beforeText ?? "";
+        const after = this.preview.afterText ?? "";
+        const fullFiles = before.length + after.length <= 12_000
+            ? `\n\nOriginal file:\n\`\`\`\n${before}\n\`\`\`\n\nProposed file:\n\`\`\`\n${after}\n\`\`\``
+            : "";
+        return `Path: ${this.preview.path}\nTool: ${this.preview.toolName}\n\nFocused hunk:\n\`\`\`diff\n${hunk}\n\`\`\`${fullFiles}`;
     }
 
     setPreview(preview: ChangePreview): void {
@@ -1570,86 +1582,240 @@ const SEMANTIC_ACTIONS = [
     "Ask a custom question",
 ] as const;
 
-type SemanticAction = (typeof SEMANTIC_ACTIONS)[number];
+type SemanticPanelMode = "menu" | "custom" | "loading" | "answer";
+
+interface SemanticExchange {
+    question: string;
+    answer: string;
+}
+
+function messageText(message: { content?: unknown }): string {
+    if (typeof message.content === "string") return message.content;
+    if (!Array.isArray(message.content)) return "";
+    return message.content
+        .filter((part): part is { type: "text"; text: string } =>
+            typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string")
+        .map((part) => part.text)
+        .join("\n");
+}
+
+function getTaskContext(ctx: ExtensionContext): string {
+    let userRequest = "";
+    let assistantIntent = "";
+
+    for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+        if (entry.type !== "message") continue;
+        const message = entry.message;
+        if (!assistantIntent && message.role === "assistant") assistantIntent = messageText(message);
+        if (!userRequest && message.role === "user") userRequest = messageText(message);
+        if (userRequest && assistantIntent) break;
+    }
+
+    return [
+        userRequest ? `Current user request:\n${userRequest.slice(0, 2_000)}` : "",
+        assistantIntent ? `Main agent's stated intent:\n${assistantIntent.slice(0, 2_000)}` : "",
+    ].filter(Boolean).join("\n\n");
+}
+
+class SemanticReviewPanel implements Component {
+    private mode: SemanticPanelMode = "menu";
+    private selected = 0;
+    private readonly input = new Input();
+    private readonly history: SemanticExchange[] = [];
+    private controller?: AbortController;
+    private _focused = false;
+
+    constructor(
+        private readonly ctx: ExtensionContext,
+        private readonly viewer: DiffViewer,
+        private readonly theme: Theme,
+        private readonly maxLines: number,
+        private readonly requestRender: () => void,
+        private readonly close: () => void,
+    ) {
+        this.input.onSubmit = (value) => {
+            if (value.trim()) void this.ask(value.trim());
+        };
+        this.input.onEscape = () => {
+            this.mode = "menu";
+            this.requestRender();
+        };
+    }
+
+    get focused(): boolean {
+        return this._focused;
+    }
+
+    set focused(value: boolean) {
+        this._focused = value;
+        this.input.focused = value && this.mode === "custom";
+    }
+
+    invalidate(): void {
+        this.input.invalidate();
+    }
+
+    dispose(): void {
+        this.controller?.abort();
+    }
+
+    private async ask(question: string): Promise<void> {
+        const codeContext = this.viewer.getSemanticCodeContext();
+        if (!codeContext || !this.ctx.model) return;
+
+        this.mode = "loading";
+        this.input.focused = false;
+        this.controller = new AbortController();
+        this.requestRender();
+
+        const priorReview = this.history
+            .map((exchange) => `Question: ${exchange.question}\nAnswer: ${exchange.answer}`)
+            .join("\n\n");
+        const userMessage: UserMessage = {
+            role: "user",
+            content: [{
+                type: "text",
+                text: [
+                    getTaskContext(this.ctx),
+                    codeContext,
+                    priorReview ? `Earlier review discussion:\n${priorReview}` : "",
+                    `Question from the human reviewer:\n${question}`,
+                ].filter(Boolean).join("\n\n"),
+            }],
+            timestamp: Date.now(),
+        };
+
+        try {
+            const response = await this.ctx.modelRegistry.complete(
+                this.ctx.model,
+                {
+                    systemPrompt: "You are a review assistant inside a prospective diff viewer. Help the human understand syntax, intent, behavior, assumptions, and simpler alternatives. You may advise, but only the human can approve or apply code. Use the supplied task and code context, be concrete, and keep the answer under eight short lines. Never claim the change has already been applied.",
+                    messages: [userMessage],
+                },
+                { signal: this.controller.signal, maxTokens: 500 },
+            );
+            if (response.stopReason === "aborted") return;
+            const answer = response.content
+                .filter((part): part is { type: "text"; text: string } => part.type === "text")
+                .map((part) => part.text)
+                .join("\n");
+            this.history.push({ question, answer: answer || "The reviewer returned no text." });
+            this.mode = "answer";
+        } catch (error) {
+            if (this.controller.signal.aborted) return;
+            const message = error instanceof Error ? error.message : String(error);
+            this.history.push({ question, answer: `Review failed: ${message}` });
+            this.mode = "answer";
+        } finally {
+            this.controller = undefined;
+            this.requestRender();
+        }
+    }
+
+    handleInput(data: string): void {
+        if (this.mode === "custom") {
+            this.input.handleInput(data);
+            this.requestRender();
+            return;
+        }
+        if (this.mode === "loading") {
+            if (matchesKey(data, "escape")) {
+                this.controller?.abort();
+                this.mode = "menu";
+                this.requestRender();
+            }
+            return;
+        }
+        if (this.mode === "answer") {
+            if (matchesKey(data, "escape")) this.close();
+            if (matchesKey(data, "return")) {
+                this.mode = "menu";
+                this.requestRender();
+            }
+            return;
+        }
+        if (matchesKey(data, "escape")) {
+            this.close();
+            return;
+        }
+        if (matchesKey(data, "up")) this.selected = Math.max(0, this.selected - 1);
+        if (matchesKey(data, "down")) this.selected = Math.min(SEMANTIC_ACTIONS.length - 1, this.selected + 1);
+        if (matchesKey(data, "return")) {
+            const action = SEMANTIC_ACTIONS[this.selected]!;
+            if (action === "Ask a custom question") {
+                this.mode = "custom";
+                this.input.setValue("");
+                this.input.focused = this.focused;
+            } else {
+                void this.ask(action);
+            }
+        }
+        this.requestRender();
+    }
+
+    private wrap(text: string, width: number): string[] {
+        return wrapTextWithAnsi(text, Math.max(1, width)).map((line) => truncateToWidth(line, width, "", false));
+    }
+
+    render(width: number): string[] {
+        const innerWidth = Math.max(1, width - 2);
+        const body: string[] = [
+            this.theme.bold(this.theme.fg("accent", " Review conversation")),
+            this.theme.fg("dim", ` ${this.ctx.model?.id ?? "no model"}`),
+            "",
+        ];
+
+        if (this.mode === "menu") {
+            body.push(this.theme.fg("muted", " Choose a question:"), "");
+            SEMANTIC_ACTIONS.forEach((action, index) => {
+                const prefix = index === this.selected ? "> " : "  ";
+                const color = index === this.selected ? "accent" : "text";
+                body.push(this.theme.fg(color, `${prefix}${action}`));
+            });
+            body.push("", this.theme.fg("dim", " ↑/↓ choose • Enter ask • Esc close"));
+        } else if (this.mode === "custom") {
+            body.push(this.theme.fg("muted", " Ask about the focused hunk:"), "", ...this.input.render(innerWidth), "", this.theme.fg("dim", " Enter ask • Esc back"));
+        } else if (this.mode === "loading") {
+            body.push(this.theme.fg("warning", " Reviewing the focused hunk…"), "", this.theme.fg("dim", " Esc cancel"));
+        } else {
+            for (const exchange of this.history) {
+                body.push(...this.wrap(this.theme.fg("accent", `Q: ${exchange.question}`), innerWidth));
+                body.push(...this.wrap(this.theme.fg("text", exchange.answer), innerWidth), "");
+            }
+            body.push(this.theme.fg("dim", " Enter ask another • Esc close"));
+        }
+
+        const visibleBody = body.slice(0, Math.max(1, this.maxLines - 2));
+        const top = this.theme.fg("accent", `┌${"─".repeat(innerWidth)}┐`);
+        const bottom = this.theme.fg("accent", `└${"─".repeat(innerWidth)}┘`);
+        return [
+            top,
+            ...visibleBody.map((line) => {
+                const safe = truncateToWidth(line, innerWidth, "", true);
+                return this.theme.fg("accent", "│") + safe + this.theme.fg("accent", "│");
+            }),
+            bottom,
+        ];
+    }
+}
 
 async function askAboutCurrentHunk(ctx: ExtensionContext, viewer: DiffViewer): Promise<void> {
     if (!ctx.model) {
         ctx.ui.notify("Select a model before asking about a hunk.", "warning");
         return;
     }
-
-    const action = await ctx.ui.select("Discuss the current hunk", [...SEMANTIC_ACTIONS]) as SemanticAction | undefined;
-    if (!action) return;
-
-    const customQuestion = action === "Ask a custom question"
-        ? await ctx.ui.editor("Question about the current hunk", "")
-        : undefined;
-    if (action === "Ask a custom question" && !customQuestion?.trim()) return;
-
-    const hunk = viewer.getCurrentHunkText();
-    if (!hunk) {
+    if (!viewer.getCurrentHunkText()) {
         ctx.ui.notify("This preview has no structured hunk to discuss.", "warning");
         return;
     }
 
-    const question = customQuestion?.trim() || action;
-    const userMessage: UserMessage = {
-        role: "user",
-        content: [{ type: "text", text: `Question: ${question}\n\nProspective diff hunk:\n\`\`\`diff\n${hunk}\n\`\`\`` }],
-        timestamp: Date.now(),
-    };
-
-    const answer = await ctx.ui.custom<string | null>(
-        (tui, theme, _keybindings, done) => {
-            const loader = new BorderedLoader(tui, theme, `Asking ${ctx.model!.id} about this hunk...`);
-            loader.onAbort = () => done(null);
-
-            ctx.modelRegistry.complete(
-                ctx.model!,
-                {
-                    systemPrompt: "You are a senior pair programmer. Answer only the question about the prospective diff. Be concrete, use plain language, and keep the answer under eight short lines. Do not claim the change has been applied.",
-                    messages: [userMessage],
-                },
-                { signal: loader.signal, maxTokens: 500 },
-            ).then((response) => {
-                if (response.stopReason === "aborted") {
-                    done(null);
-                    return;
-                }
-                done(response.content
-                    .filter((part): part is { type: "text"; text: string } => part.type === "text")
-                    .map((part) => part.text)
-                    .join("\n"));
-            }).catch((error: unknown) => {
-                const message = error instanceof Error ? error.message : String(error);
-                done(`Unable to discuss this hunk: ${message}`);
-            });
-
-            return loader;
-        },
-        { overlay: true, overlayOptions: { anchor: "center", width: "70%", maxHeight: "40%", margin: 2 } },
-    );
-
-    if (!answer) return;
-
     await ctx.ui.custom<void>(
-        (_tui, theme, _keybindings, done) => {
-            const content = new Markdown(
-                `## ${action}\n\n${answer}\n\n*Enter or Esc to return to the unchanged diff.*`,
-                1,
-                1,
-                getMarkdownTheme(),
-            );
-            const framed = new BorderFrame(content, (text) => theme.fg("accent", text));
-            return {
-                render: (width: number) => framed.render(width),
-                invalidate: () => framed.invalidate(),
-                handleInput: (data: string) => {
-                    if (matchesKey(data, "return") || matchesKey(data, "escape")) done(undefined);
-                },
-            };
+        (tui, theme, _keybindings, done) =>
+            new SemanticReviewPanel(ctx, viewer, theme, Math.max(12, tui.terminal.rows - 4), () => tui.requestRender(), done),
+        {
+            overlay: true,
+            overlayOptions: { anchor: "left-center", width: "30%", maxHeight: "90%", margin: 1 },
         },
-        { overlay: true, overlayOptions: { anchor: "center", width: "80%", maxHeight: "80%", margin: 2 } },
     );
 }
 
@@ -1807,8 +1973,8 @@ export async function reviewChangePreview(
             {
                 overlay: true,
                 overlayOptions: {
-                    anchor: "center",
-                    width: "96%",
+                    anchor: "right-center",
+                    width: "69%",
                     minWidth: 20,
                     margin: 1,
                 },

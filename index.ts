@@ -1,4 +1,3 @@
-import { Buffer } from "node:buffer";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -409,24 +408,18 @@ export default function showDiffsExtension(pi: ExtensionAPI) {
 		await mkdir(dirname(preview.absolutePath), { recursive: true });
 		await writeFile(preview.absolutePath, finalContent, "utf-8");
 
+		const reviewNotice = `Human review changed and approved your proposed ${preview.toolName} change to ${preview.path}. The reviewed final contents were applied; treat the file on disk as the source of truth before continuing.`;
+
 		if (preview.toolName === "edit") {
 			const diffResult = generateDiffString(preview.beforeText ?? "", afterText);
 			return {
-				content: [{ type: "text", text: `Successfully applied reviewed final contents to ${preview.path}.` }],
+				content: [{ type: "text", text: reviewNotice }],
 				details: { diff: diffResult.diff, firstChangedLine: diffResult.firstChangedLine },
 			};
 		}
 
 		return {
-			content: [
-				{
-					type: "text",
-					text:
-						preview.toolName === "write"
-							? `Successfully wrote ${Buffer.byteLength(finalContent, "utf-8")} bytes to ${preview.path}`
-							: `Successfully applied reviewed final contents to ${preview.path}.`,
-				},
-			],
+			content: [{ type: "text", text: reviewNotice }],
 			details: undefined,
 		};
 	}
