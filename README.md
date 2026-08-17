@@ -1,6 +1,6 @@
-# pi-show-diffs
+# pi-atomic-diffs
 
-warp.dev inspired **pi** extension that stops and shows an editable diff before file changes are applied.
+A fork of [pi-show-diffs](https://github.com/xRyul/pi-show-diffs) for slow, human-reviewed atomic code changes. It stops and shows an editable diff before file changes are applied.
 
 https://github.com/user-attachments/assets/8bda7619-fcd2-4615-a93a-d15b2fee408b
 
@@ -11,6 +11,12 @@ It currently reviews:
 - `write`
 
 This gives **pi** an interactive pre-apply diff review step, so you can inspect the proposed change first and then decide whether to allow it.
+
+## Discuss a hunk
+
+Press `?` while reviewing a structured diff to discuss the currently focused hunk with Pi's active model. You can ask for a syntax explanation, rationale, behavior change, hidden assumption, less invasive alternative, or enter a custom question. The answer opens over the prospective diff and does not change the candidate.
+
+This feature requires Pi's terminal TUI. ACP clients cannot render custom Pi components.
 
 ## Diff review UX
 
@@ -61,6 +67,7 @@ Command args:
 
 ### Approval actions
 
+- `?` - discuss the current hunk with the active model
 - `Enter`, `a`, or `y` - approve
 - `r` or `Esc` - reject
 - `E` or `e` - enter inline edit mode for the updated side

@@ -1,8 +1,10 @@
-import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { UserMessage } from "@earendil-works/pi-ai";
+import { BorderedLoader, getMarkdownTheme, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { t } from "./i18n.js";
 import {
     CURSOR_MARKER,
     Editor,
+    Markdown,
     matchesKey,
     truncateToWidth,
     visibleWidth,
@@ -378,6 +380,23 @@ class DiffViewer implements Component {
 
     getPreview(): ChangePreview {
         return this.preview;
+    }
+
+    getCurrentHunkText(): string | undefined {
+        const diff = this.getNavigationDiff();
+        if (!diff || diff.hunks.length === 0) return undefined;
+
+        const hunkIndex = this.buildLayout(this.lastWidth).currentHunkIndex;
+        const hunk = diff.hunks[clampNumber(hunkIndex, 0, diff.hunks.length - 1)]!;
+        const lines: string[] = [];
+
+        for (const row of diff.rows.slice(hunk.changeStartRow, hunk.changeEndRow + 1)) {
+            if (row.kind === "delete" || row.kind === "replace") lines.push(`-${row.oldText}`);
+            if (row.kind === "insert" || row.kind === "replace") lines.push(`+${row.newText}`);
+            if (row.kind === "equal") lines.push(` ${row.oldText}`);
+        }
+
+        return lines.join("\n");
     }
 
     setPreview(preview: ChangePreview): void {
@@ -816,6 +835,7 @@ class DiffViewer implements Component {
             fmt(kb.approve, t("ui.footerApproveAction", "approve")),
             fmt(kb.reject, t("ui.footerRejectAction", "reject")),
             fmt(kb.steer, t("ui.footerSteerAction", "steer")),
+            "? discuss",
             fmt(kb.autoApprove, t("ui.footerAutoAction", "auto")),
         ].filter((part): part is string => part !== null);
         return [truncateToWidth(this.theme.fg("dim", parts.join(" • ")), width, "", false)];
@@ -1541,6 +1561,98 @@ function percentSizeValue(percent: number): SizeValue {
     return `${Number.isInteger(percent) ? percent : Number(percent.toFixed(2))}%` as SizeValue;
 }
 
+const SEMANTIC_ACTIONS = [
+    "Explain this hunk",
+    "Why is this needed?",
+    "What behavior changes?",
+    "What assumption is being made?",
+    "Suggest a less invasive version",
+    "Ask a custom question",
+] as const;
+
+type SemanticAction = (typeof SEMANTIC_ACTIONS)[number];
+
+async function askAboutCurrentHunk(ctx: ExtensionContext, viewer: DiffViewer): Promise<void> {
+    if (!ctx.model) {
+        ctx.ui.notify("Select a model before asking about a hunk.", "warning");
+        return;
+    }
+
+    const action = await ctx.ui.select("Discuss the current hunk", [...SEMANTIC_ACTIONS]) as SemanticAction | undefined;
+    if (!action) return;
+
+    const customQuestion = action === "Ask a custom question"
+        ? await ctx.ui.editor("Question about the current hunk", "")
+        : undefined;
+    if (action === "Ask a custom question" && !customQuestion?.trim()) return;
+
+    const hunk = viewer.getCurrentHunkText();
+    if (!hunk) {
+        ctx.ui.notify("This preview has no structured hunk to discuss.", "warning");
+        return;
+    }
+
+    const question = customQuestion?.trim() || action;
+    const userMessage: UserMessage = {
+        role: "user",
+        content: [{ type: "text", text: `Question: ${question}\n\nProspective diff hunk:\n\`\`\`diff\n${hunk}\n\`\`\`` }],
+        timestamp: Date.now(),
+    };
+
+    const answer = await ctx.ui.custom<string | null>(
+        (tui, theme, _keybindings, done) => {
+            const loader = new BorderedLoader(tui, theme, `Asking ${ctx.model!.id} about this hunk...`);
+            loader.onAbort = () => done(null);
+
+            ctx.modelRegistry.complete(
+                ctx.model!,
+                {
+                    systemPrompt: "You are a senior pair programmer. Answer only the question about the prospective diff. Be concrete, use plain language, and keep the answer under eight short lines. Do not claim the change has been applied.",
+                    messages: [userMessage],
+                },
+                { signal: loader.signal, maxTokens: 500 },
+            ).then((response) => {
+                if (response.stopReason === "aborted") {
+                    done(null);
+                    return;
+                }
+                done(response.content
+                    .filter((part): part is { type: "text"; text: string } => part.type === "text")
+                    .map((part) => part.text)
+                    .join("\n"));
+            }).catch((error: unknown) => {
+                const message = error instanceof Error ? error.message : String(error);
+                done(`Unable to discuss this hunk: ${message}`);
+            });
+
+            return loader;
+        },
+        { overlay: true, overlayOptions: { anchor: "center", width: "70%", maxHeight: "40%", margin: 2 } },
+    );
+
+    if (!answer) return;
+
+    await ctx.ui.custom<void>(
+        (_tui, theme, _keybindings, done) => {
+            const content = new Markdown(
+                `## ${action}\n\n${answer}\n\n*Enter or Esc to return to the unchanged diff.*`,
+                1,
+                1,
+                getMarkdownTheme(),
+            );
+            const framed = new BorderFrame(content, (text) => theme.fg("accent", text));
+            return {
+                render: (width: number) => framed.render(width),
+                invalidate: () => framed.invalidate(),
+                handleInput: (data: string) => {
+                    if (matchesKey(data, "return") || matchesKey(data, "escape")) done(undefined);
+                },
+            };
+        },
+        { overlay: true, overlayOptions: { anchor: "center", width: "80%", maxHeight: "80%", margin: 2 } },
+    );
+}
+
 export async function reviewChangePreview(
     ctx: ExtensionContext,
     preview: ChangePreview,
@@ -1663,6 +1775,10 @@ export async function reviewChangePreview(
                             return;
                         }
 
+                        if (data === "?") {
+                            void askAboutCurrentHunk(ctx, viewer);
+                            return;
+                        }
                         if (matchesBinding(data, kb.approve)) {
                             done(approvedDecisionFromViewer(viewer, "approve"));
                             return;
@@ -1762,6 +1878,10 @@ export async function reviewChangePreview(
                                     return;
                                 }
 
+                                if (data === "?") {
+                                    void askAboutCurrentHunk(ctx, oViewer);
+                                    return;
+                                }
                                 if (matchesBinding(data, kb.toggleExpand)) {
                                     syncCurrentPreviewFromViewer(oViewer);
                                     oDone({ action: "collapse" });
@@ -1825,6 +1945,10 @@ export async function reviewChangePreview(
                         return;
                     }
 
+                    if (data === "?") {
+                        void askAboutCurrentHunk(ctx, viewer);
+                        return;
+                    }
                     if (matchesBinding(data, kb.toggleExpand)) {
                         launchOverlay();
                         return;
