@@ -14,7 +14,7 @@ This gives **pi** an interactive pre-apply diff review step, so you can inspect 
 
 ## Discuss a hunk
 
-Press `?` while reviewing a structured diff to discuss the currently focused hunk with Pi's active model. You can ask for a syntax explanation, rationale, behavior change, hidden assumption, less invasive alternative, or enter a custom question. The answer opens over the prospective diff and does not change the candidate.
+Press `r` while reviewing a structured diff to discuss the currently focused hunk with Pi's active model. You can ask for a syntax explanation, rationale, behavior change, hidden assumption, less invasive alternative, or enter a custom question. The answer opens over the prospective diff and does not change the candidate.
 
 This feature requires Pi's terminal TUI. ACP clients cannot render custom Pi components.
 
@@ -67,7 +67,7 @@ Command args:
 
 ### Approval actions
 
-- `?` - discuss the current hunk with the active model
+- `r` - review the current hunk with the active model
 - `Enter`, `a`, or `y` - approve
 - `r` or `Esc` - reject
 - `E` or `e` - enter inline edit mode for the updated side

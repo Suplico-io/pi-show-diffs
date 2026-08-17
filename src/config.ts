@@ -27,7 +27,7 @@ export interface DiffKeybindings {
 
 export const DEFAULT_KEYBINDINGS: DiffKeybindings = {
 	approve: ["Enter", "a", "y"],
-	reject: ["Escape", "r"],
+	reject: ["Escape"],
 	steer: ["s"],
 	editInline: ["e", "E"],
 	autoApprove: ["A"],

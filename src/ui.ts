@@ -835,7 +835,7 @@ class DiffViewer implements Component {
             fmt(kb.approve, t("ui.footerApproveAction", "approve")),
             fmt(kb.reject, t("ui.footerRejectAction", "reject")),
             fmt(kb.steer, t("ui.footerSteerAction", "steer")),
-            "? discuss",
+            "r review",
             fmt(kb.autoApprove, t("ui.footerAutoAction", "auto")),
         ].filter((part): part is string => part !== null);
         return [truncateToWidth(this.theme.fg("dim", parts.join(" • ")), width, "", false)];
@@ -1775,7 +1775,7 @@ export async function reviewChangePreview(
                             return;
                         }
 
-                        if (data === "?") {
+                        if (data === "r") {
                             void askAboutCurrentHunk(ctx, viewer);
                             return;
                         }
@@ -1878,7 +1878,7 @@ export async function reviewChangePreview(
                                     return;
                                 }
 
-                                if (data === "?") {
+                                if (data === "r") {
                                     void askAboutCurrentHunk(ctx, oViewer);
                                     return;
                                 }
@@ -1945,7 +1945,7 @@ export async function reviewChangePreview(
                         return;
                     }
 
-                    if (data === "?") {
+                    if (data === "r") {
                         void askAboutCurrentHunk(ctx, viewer);
                         return;
                     }
