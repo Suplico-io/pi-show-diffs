@@ -5,6 +5,7 @@ import {
     CURSOR_MARKER,
     Editor,
     Input,
+    Text,
     matchesKey,
     truncateToWidth,
     visibleWidth,
@@ -805,73 +806,11 @@ class DiffViewer implements Component {
         return [leftHeader + split.gutterText + rightHeader, divider];
     }
 
-    private buildFooterLines(width: number, mode: ViewMode): string[] {
-        if (this.inlineEditMode) {
-            return [
-                truncateToWidth(
-                    this.theme.fg(
-                        "dim",
-                        "Editing inline • Esc review • Ctrl+N/Ctrl+P hunks • Alt/Option+↓/↑ if your terminal sends Alt • Enter newline • Tab indent",
-                    ),
-                    width,
-                    "",
-                    false,
-                ),
-            ];
-        }
-
-        const { kb } = this;
-        const keyLabel = (key: string): string => {
-            const labels: Record<string, string> = {
-                up: "↑",
-                down: "↓",
-                left: "←",
-                right: "→",
-                pageUp: "PgUp",
-                pageDown: "PgDn",
-                home: "Home",
-                end: "End",
-                Escape: "Esc",
-                escape: "Esc",
-                Tab: "Tab",
-                tab: "Tab",
-            };
-            return labels[key] ?? key;
-        };
-        const formatBinding = (binding: string[] | false): string | null => {
-            if (!binding || binding.length === 0) return null;
-            return binding.map(keyLabel).join("/");
-        };
-        const fmt = (binding: string[] | false, label: string): string | null => {
-            const keys = formatBinding(binding);
-            return keys ? `${keys} ${label}` : null;
-        };
-        const fmtPair = (first: string[] | false, second: string[] | false, label: string): string | null => {
-            const firstKeys = formatBinding(first);
-            const secondKeys = formatBinding(second);
-            return firstKeys && secondKeys ? `${firstKeys}/${secondKeys} ${label}` : null;
-        };
-        const hasHunks = (this.getNavigationDiff()?.hunks.length ?? 0) > 0;
-        const hasStructuredDiff = Boolean(this.baseDiffModel);
-
-        const parts: string[] = [
-            hasHunks ? fmt(kb.prevHunk, "prev") : null,
-            hasHunks ? fmt(kb.nextHunk, "next") : null,
-            fmtPair(kb.scrollUp, kb.scrollDown, "scroll"),
-            fmtPair(kb.pageUp, kb.pageDown, "jump"),
-            fmtPair(kb.scrollTop, kb.scrollBottom, "edges"),
-            hasStructuredDiff ? fmtPair(kb.contextLess, kb.contextMore, "ctx-/+") : null,
-            hasStructuredDiff ? fmt(kb.toggleMode, "split/unified") : null,
-            fmt(kb.toggleWrap, "wrap"),
-            this.allowAfterEdit ? fmt(kb.editInline, t("ui.footerEditAction", "edit")) : null,
-            this.expandableLayoutHint ? fmt(kb.toggleExpand, this.expandedView ? t("ui.footerCollapseAction", "collapse") : t("ui.footerExpandAction", "expand")) : null,
-            fmt(kb.approve, t("ui.footerApproveAction", "approve")),
-            fmt(kb.reject, t("ui.footerRejectAction", "reject")),
-            fmt(kb.steer, t("ui.footerSteerAction", "steer")),
-            "r review",
-            fmt(kb.autoApprove, t("ui.footerAutoAction", "auto")),
-        ].filter((part): part is string => part !== null);
-        return [truncateToWidth(this.theme.fg("dim", parts.join(" • ")), width, "", false)];
+    private buildFooterLines(width: number, _mode: ViewMode): string[] {
+        const help = this.inlineEditMode
+            ? "Esc review • Enter newline • Tab indent • Ctrl+N/P hunks"
+            : `Enter approve • Esc reject • r review${this.allowAfterEdit ? " • e edit" : ""} • h help`;
+        return [truncateToWidth(this.theme.fg("dim", help), width, "", false)];
     }
 
     private wrapStyledText(text: string, width: number): string[] {
@@ -1885,6 +1824,45 @@ class SemanticReviewPanel implements Component {
     }
 }
 
+async function showDiffHelp(ctx: ExtensionContext): Promise<void> {
+    await ctx.ui.custom<void>(
+        (_tui, theme, _keybindings, done) => {
+            const content = new Text([
+                theme.bold(theme.fg("accent", "Diff review help")),
+                "",
+                theme.fg("muted", "Primary"),
+                "Enter  approve",
+                "Esc    reject",
+                "r      review focused hunk",
+                "e      edit candidate inline",
+                "s      reject with guidance",
+                "",
+                theme.fg("muted", "Navigation"),
+                "↑/↓    scroll",
+                "n/p    next/previous hunk",
+                "PgUp/PgDn  page",
+                "Home/End   edges",
+                "",
+                theme.fg("muted", "View"),
+                "Tab    split/unified",
+                "w      wrap lines",
+                "←/→    less/more context",
+                "",
+                theme.fg("dim", "Enter, Esc, or h to close"),
+            ].join("\n"), 1, 1);
+            const framed = new BorderFrame(content, (text) => theme.fg("accent", text));
+            return {
+                render: (width: number) => framed.render(width),
+                invalidate: () => framed.invalidate(),
+                handleInput: (data: string) => {
+                    if (matchesKey(data, "return") || matchesKey(data, "escape") || data === "h") done(undefined);
+                },
+            };
+        },
+        { overlay: true, overlayOptions: { anchor: "left-center", width: "30%", maxHeight: "90%", margin: 1 } },
+    );
+}
+
 async function askAboutCurrentHunk(ctx: ExtensionContext, viewer: DiffViewer): Promise<void> {
     if (!ctx.model) {
         ctx.ui.notify("Select a model before asking about a hunk.", "warning");
@@ -2027,6 +2005,10 @@ export async function reviewChangePreview(
                             return;
                         }
 
+                        if (data === "h") {
+                            void showDiffHelp(ctx);
+                            return;
+                        }
                         if (data === "r") {
                             void askAboutCurrentHunk(ctx, viewer);
                             return;
@@ -2130,6 +2112,10 @@ export async function reviewChangePreview(
                                     return;
                                 }
 
+                                if (data === "h") {
+                                    void showDiffHelp(ctx);
+                                    return;
+                                }
                                 if (data === "r") {
                                     void askAboutCurrentHunk(ctx, oViewer);
                                     return;
@@ -2197,6 +2183,10 @@ export async function reviewChangePreview(
                         return;
                     }
 
+                    if (data === "h") {
+                        void showDiffHelp(ctx);
+                        return;
+                    }
                     if (data === "r") {
                         void askAboutCurrentHunk(ctx, viewer);
                         return;

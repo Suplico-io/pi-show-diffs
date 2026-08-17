@@ -69,9 +69,10 @@ Command args:
 
 ### Approval actions
 
-- `r` - review the current hunk with the active model
 - `Enter`, `a`, or `y` - approve
-- `r` or `Esc` - reject
+- `Esc` - reject
+- `r` - review the current hunk with the active model
+- `h` - show navigation and view help
 - `E` or `e` - enter inline edit mode for the updated side
 - `Esc` in inline edit mode — leave editing and return to review mode
 - `s` - steer and add feedback
@@ -112,7 +113,7 @@ Current config shape:
   "expandedWidth": "100%",
   "keybindings": {
     "approve": ["Enter", "a", "y"],
-    "reject": ["Escape", "r"]
+    "reject": ["Escape"]
   }
 }
 ```
