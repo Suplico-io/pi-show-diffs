@@ -399,6 +399,27 @@ class DiffViewer implements Component {
         return lines.join("\n");
     }
 
+    applyCurrentHunkRevision(replacement: string): boolean {
+        const diff = this.getNavigationDiff();
+        const afterText = this.preview.afterText;
+        if (!diff || afterText === undefined || diff.hunks.length === 0) return false;
+
+        const hunkIndex = this.buildLayout(this.lastWidth).currentHunkIndex;
+        const hunk = diff.hunks[clampNumber(hunkIndex, 0, diff.hunks.length - 1)]!;
+        if (hunk.newStartLine === undefined || hunk.newEndLine === undefined) return false;
+
+        const trailingNewline = afterText.endsWith("\n");
+        const lines = afterText.split("\n");
+        if (trailingNewline) lines.pop();
+        const replacementLines = replacement.length === 0
+            ? []
+            : replacement.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n");
+        lines.splice(hunk.newStartLine - 1, hunk.newEndLine - hunk.newStartLine + 1, ...replacementLines);
+        const nextText = lines.join("\n") + (trailingNewline ? "\n" : "");
+        this.setPreview(rebuildPreviewAfterManualEdit(this.preview, nextText));
+        return true;
+    }
+
     getSemanticCodeContext(): string | undefined {
         const hunk = this.getCurrentHunkText();
         if (!hunk) return undefined;
@@ -1574,19 +1595,35 @@ function percentSizeValue(percent: number): SizeValue {
 }
 
 const SEMANTIC_ACTIONS = [
-    "Explain this hunk",
+    "Explain the syntax in this hunk",
     "Why is this needed?",
     "What behavior changes?",
     "What assumption is being made?",
-    "Suggest a less invasive version",
+    "Propose a minimal revision",
     "Ask a custom question",
 ] as const;
 
-type SemanticPanelMode = "menu" | "custom" | "loading" | "answer";
+type SemanticPanelMode = "menu" | "custom" | "loading" | "answer" | "suggestion";
 
 interface SemanticExchange {
     question: string;
     answer: string;
+}
+
+interface RevisionSuggestion {
+    explanation: string;
+    replacement: string;
+}
+
+function parseRevisionSuggestion(text: string): RevisionSuggestion | undefined {
+    const unfenced = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    try {
+        const parsed = JSON.parse(unfenced) as Partial<RevisionSuggestion>;
+        if (typeof parsed.explanation === "string" && typeof parsed.replacement === "string") {
+            return { explanation: parsed.explanation, replacement: parsed.replacement };
+        }
+    } catch {}
+    return undefined;
 }
 
 function messageText(message: { content?: unknown }): string {
@@ -1622,6 +1659,7 @@ class SemanticReviewPanel implements Component {
     private selected = 0;
     private readonly input = new Input();
     private readonly history: SemanticExchange[] = [];
+    private suggestion?: RevisionSuggestion;
     private controller?: AbortController;
     private _focused = false;
 
@@ -1686,21 +1724,34 @@ class SemanticReviewPanel implements Component {
         };
 
         try {
+            const wantsRevision = question === "Propose a minimal revision";
             const response = await this.ctx.modelRegistry.complete(
                 this.ctx.model,
                 {
-                    systemPrompt: "You are a review assistant inside a prospective diff viewer. Help the human understand syntax, intent, behavior, assumptions, and simpler alternatives. You may advise, but only the human can approve or apply code. Use the supplied task and code context, be concrete, and keep the answer under eight short lines. Never claim the change has already been applied.",
+                    systemPrompt: wantsRevision
+                        ? "You are a review assistant inside a prospective diff viewer. Propose the smallest useful replacement for only the proposed-side lines in the focused hunk. Return valid JSON only: {\"explanation\":\"brief reason\",\"replacement\":\"exact replacement text\"}. Preserve the project's language and style. Do not include Markdown fences. The human alone decides whether to use or approve it."
+                        : "You are a language-agnostic review assistant inside a prospective diff viewer. Help the human understand syntax, intent, behavior, assumptions, and simpler alternatives in whatever language the project uses. You may advise, but only the human can approve or apply code. Use the supplied task and code context, be concrete, and keep the answer under eight short lines. Never claim the change has already been applied.",
                     messages: [userMessage],
                 },
-                { signal: this.controller.signal, maxTokens: 500 },
+                { signal: this.controller.signal, maxTokens: wantsRevision ? 1_000 : 500 },
             );
             if (response.stopReason === "aborted") return;
             const answer = response.content
                 .filter((part): part is { type: "text"; text: string } => part.type === "text")
                 .map((part) => part.text)
                 .join("\n");
-            this.history.push({ question, answer: answer || "The reviewer returned no text." });
-            this.mode = "answer";
+            if (wantsRevision) {
+                this.suggestion = parseRevisionSuggestion(answer);
+                if (this.suggestion) {
+                    this.mode = "suggestion";
+                } else {
+                    this.history.push({ question, answer: "The reviewer did not return a valid structured revision. The candidate was not changed." });
+                    this.mode = "answer";
+                }
+            } else {
+                this.history.push({ question, answer: answer || "The reviewer returned no text." });
+                this.mode = "answer";
+            }
         } catch (error) {
             if (this.controller.signal.aborted) return;
             const message = error instanceof Error ? error.message : String(error);
@@ -1722,6 +1773,26 @@ class SemanticReviewPanel implements Component {
             if (matchesKey(data, "escape")) {
                 this.controller?.abort();
                 this.mode = "menu";
+                this.requestRender();
+            }
+            return;
+        }
+        if (this.mode === "suggestion") {
+            if (matchesKey(data, "escape")) {
+                this.suggestion = undefined;
+                this.mode = "menu";
+                this.requestRender();
+            }
+            if (matchesKey(data, "return") && this.suggestion) {
+                const applied = this.viewer.applyCurrentHunkRevision(this.suggestion.replacement);
+                this.history.push({
+                    question: "Propose a minimal revision",
+                    answer: applied
+                        ? `${this.suggestion.explanation}\n\nAccepted into the in-memory candidate; final file approval is still required.`
+                        : "This hunk could not be revised automatically. Use inline edit instead.",
+                });
+                this.suggestion = undefined;
+                this.mode = "answer";
                 this.requestRender();
             }
             return;
@@ -1777,6 +1848,12 @@ class SemanticReviewPanel implements Component {
             body.push(this.theme.fg("muted", " Ask about the focused hunk:"), "", ...this.input.render(innerWidth), "", this.theme.fg("dim", " Enter ask • Esc back"));
         } else if (this.mode === "loading") {
             body.push(this.theme.fg("warning", " Reviewing the focused hunk…"), "", this.theme.fg("dim", " Esc cancel"));
+        } else if (this.mode === "suggestion" && this.suggestion) {
+            body.push(...this.wrap(this.theme.fg("accent", "Proposed minimal revision"), innerWidth), "");
+            body.push(...this.wrap(this.theme.fg("text", this.suggestion.explanation), innerWidth), "");
+            body.push(this.theme.fg("muted", "Replacement:"));
+            body.push(...this.wrap(this.theme.fg("text", this.suggestion.replacement), innerWidth), "");
+            body.push(this.theme.fg("dim", " Enter use in candidate • Esc discard"));
         } else {
             for (const exchange of this.history) {
                 body.push(...this.wrap(this.theme.fg("accent", `Q: ${exchange.question}`), innerWidth));

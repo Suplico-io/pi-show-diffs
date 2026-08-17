@@ -14,9 +14,9 @@ This gives **pi** an interactive pre-apply diff review step, so you can inspect 
 
 ## Discuss a hunk
 
-Press `r` while reviewing a structured diff to open a conversation panel beside the diff. You can ask for a syntax explanation, rationale, behavior change, hidden assumption, less invasive alternative, or enter a custom question. The review assistant receives the latest user request, the main agent's stated intent, the focused hunk, and full original/proposed files when they are small enough. Questions and answers remain in the panel for that review and do not change the candidate.
+Press `r` while reviewing a structured diff to open a conversation panel beside the diff. You can ask for a language-agnostic syntax explanation, rationale, behavior change, hidden assumption, minimal revision, or enter a custom question. The review assistant receives the latest user request, the main agent's stated intent, the focused hunk, and full original/proposed files when they are small enough. Questions and answers remain in the panel for that review and do not change the candidate.
 
-If the human edits the candidate before approval, the main agent's tool result explicitly reports that the reviewed version—not its original proposal—was applied.
+A minimal revision is shown in the panel first. Enter accepts it into the in-memory candidate and updates the diff; Esc discards it. The final file still requires normal human approval. If the candidate changes before approval, the main agent's tool result explicitly reports that the reviewed version—not its original proposal—was applied.
 
 This feature requires Pi's terminal TUI. ACP clients cannot render custom Pi components.
 
