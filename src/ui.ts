@@ -1599,7 +1599,7 @@ const SEMANTIC_ACTIONS = [
     "Why is this needed?",
     "What behavior changes?",
     "What assumption is being made?",
-    "Propose a minimal revision",
+    "Propose a guided revision",
     "Ask a custom question",
 ] as const;
 
@@ -1660,6 +1660,7 @@ class SemanticReviewPanel implements Component {
     private readonly input = new Input();
     private readonly history: SemanticExchange[] = [];
     private suggestion?: RevisionSuggestion;
+    private inputPurpose: "question" | "revision" = "question";
     private controller?: AbortController;
     private _focused = false;
 
@@ -1672,7 +1673,12 @@ class SemanticReviewPanel implements Component {
         private readonly close: () => void,
     ) {
         this.input.onSubmit = (value) => {
-            if (value.trim()) void this.ask(value.trim());
+            const guidance = value.trim();
+            if (!guidance) return;
+            void this.ask(
+                this.inputPurpose === "revision" ? `Human revision guidance: ${guidance}` : guidance,
+                this.inputPurpose === "revision",
+            );
         };
         this.input.onEscape = () => {
             this.mode = "menu";
@@ -1697,7 +1703,7 @@ class SemanticReviewPanel implements Component {
         this.controller?.abort();
     }
 
-    private async ask(question: string): Promise<void> {
+    private async ask(question: string, wantsRevision = false): Promise<void> {
         const codeContext = this.viewer.getSemanticCodeContext();
         if (!codeContext || !this.ctx.model) return;
 
@@ -1724,12 +1730,11 @@ class SemanticReviewPanel implements Component {
         };
 
         try {
-            const wantsRevision = question === "Propose a minimal revision";
             const response = await this.ctx.modelRegistry.complete(
                 this.ctx.model,
                 {
                     systemPrompt: wantsRevision
-                        ? "You are a review assistant inside a prospective diff viewer. Propose the smallest useful replacement for only the proposed-side lines in the focused hunk. Return valid JSON only: {\"explanation\":\"brief reason\",\"replacement\":\"exact replacement text\"}. Preserve the project's language and style. Do not include Markdown fences. The human alone decides whether to use or approve it."
+                        ? "You are a review assistant inside a prospective diff viewer. Follow the human's revision guidance and propose the smallest useful replacement for only the proposed-side lines in the focused hunk. Return valid JSON only: {\"explanation\":\"brief reason\",\"replacement\":\"exact replacement text\"}. Preserve the project's language and style. Do not include Markdown fences. The human alone decides whether to use or approve it."
                         : "You are a language-agnostic review assistant inside a prospective diff viewer. Help the human understand syntax, intent, behavior, assumptions, and simpler alternatives in whatever language the project uses. You may advise, but only the human can approve or apply code. Use the supplied task and code context, be concrete, and keep the answer under eight short lines. Never claim the change has already been applied.",
                     messages: [userMessage],
                 },
@@ -1786,7 +1791,7 @@ class SemanticReviewPanel implements Component {
             if (matchesKey(data, "return") && this.suggestion) {
                 const applied = this.viewer.applyCurrentHunkRevision(this.suggestion.replacement);
                 this.history.push({
-                    question: "Propose a minimal revision",
+                    question: "Propose a guided revision",
                     answer: applied
                         ? `${this.suggestion.explanation}\n\nAccepted into the in-memory candidate; final file approval is still required.`
                         : "This hunk could not be revised automatically. Use inline edit instead.",
@@ -1813,8 +1818,9 @@ class SemanticReviewPanel implements Component {
         if (matchesKey(data, "down")) this.selected = Math.min(SEMANTIC_ACTIONS.length - 1, this.selected + 1);
         if (matchesKey(data, "return")) {
             const action = SEMANTIC_ACTIONS[this.selected]!;
-            if (action === "Ask a custom question") {
+            if (action === "Ask a custom question" || action === "Propose a guided revision") {
                 this.mode = "custom";
+                this.inputPurpose = action === "Propose a guided revision" ? "revision" : "question";
                 this.input.setValue("");
                 this.input.focused = this.focused;
             } else {
@@ -1845,11 +1851,14 @@ class SemanticReviewPanel implements Component {
             });
             body.push("", this.theme.fg("dim", " ↑/↓ choose • Enter ask • Esc close"));
         } else if (this.mode === "custom") {
-            body.push(this.theme.fg("muted", " Ask about the focused hunk:"), "", ...this.input.render(innerWidth), "", this.theme.fg("dim", " Enter ask • Esc back"));
+            const prompt = this.inputPurpose === "revision"
+                ? " What should the revision improve?"
+                : " Ask about the focused hunk:";
+            body.push(this.theme.fg("muted", prompt), "", ...this.input.render(innerWidth), "", this.theme.fg("dim", " Enter submit • Esc back"));
         } else if (this.mode === "loading") {
             body.push(this.theme.fg("warning", " Reviewing the focused hunk…"), "", this.theme.fg("dim", " Esc cancel"));
         } else if (this.mode === "suggestion" && this.suggestion) {
-            body.push(...this.wrap(this.theme.fg("accent", "Proposed minimal revision"), innerWidth), "");
+            body.push(...this.wrap(this.theme.fg("accent", "Proposed guided revision"), innerWidth), "");
             body.push(...this.wrap(this.theme.fg("text", this.suggestion.explanation), innerWidth), "");
             body.push(this.theme.fg("muted", "Replacement:"));
             body.push(...this.wrap(this.theme.fg("text", this.suggestion.replacement), innerWidth), "");
