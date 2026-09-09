@@ -14,9 +14,13 @@ This gives **pi** an interactive pre-apply diff review step, so you can inspect 
 
 ## Discuss a hunk
 
-Press `r` while reviewing a structured diff to open a conversation panel beside the diff. You can ask for a language-agnostic syntax explanation, rationale, behavior change, hidden assumption, guided revision, or enter a custom question. The review assistant receives the latest user request, the main agent's stated intent, the focused hunk, and full original/proposed files when they are small enough. Questions and answers remain in the panel for that review and do not change the candidate.
+Press `r` while reviewing a structured diff to open a conversation panel beside the diff. You can ask for a language-agnostic syntax explanation, rationale, behavior change, hidden assumption, guided revision, or enter a custom question. The no-tools review conversation receives the last two textual user/assistant pairs (bounded to 8 KiB), the focused hunk, and full original/proposed files when they are small enough. It uses the current model and thinking level but does not create another saved Pi session.
 
 A guided revision first asks what you want improved, then shows the smallest suggested replacement in the panel. Enter accepts it into the in-memory candidate and updates the diff; Esc discards it. The final file still requires normal human approval. If the candidate changes before approval, the main agent's tool result explicitly reports that the reviewed version—not its original proposal—was applied.
+
+When discussion, inline editing, or revision guidance materially affects the review, the main session receives a concise review receipt. Expanding that custom message shows the complete local exchange; the model-visible content contains only the outcome and actionable instruction.
+
+The receipt uses the same `ActionReviewReceiptV1` envelope documented by `pi-dcg-review`: artifact label and content digests, deterministic trigger metadata, disposition, concise summary, full transcript, and revision metadata. Each package implements the convention independently so neither is a runtime dependency of the other.
 
 This feature requires Pi's terminal TUI. ACP clients cannot render custom Pi components.
 

@@ -1,4 +1,4 @@
-import type { UserMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { t } from "./i18n.js";
 import {
@@ -26,11 +26,13 @@ import {
 import { DEFAULT_KEYBINDINGS, type DiffColorMode, type DiffKeybindings } from "./config.js";
 import { rebuildPreviewAfterManualEdit, type ChangePreview } from "./preview.js";
 import { detectSyntaxLanguage, tokenizeSyntaxLine, type SyntaxSegment } from "./syntax-highlight.js";
+import { extractRecentContext, type DiffReviewActivity } from "./review-session.js";
 
 export interface DiffDecision {
     action: "approve" | "reject" | "steer" | "approve_and_enable_auto";
     feedback?: string;
     afterTextOverride?: string;
+    reviewActivity?: DiffReviewActivity;
 }
 
 interface ReviewOptions {
@@ -1544,11 +1546,6 @@ const SEMANTIC_ACTIONS = [
 
 type SemanticPanelMode = "menu" | "custom" | "loading" | "answer" | "suggestion";
 
-interface SemanticExchange {
-    question: string;
-    answer: string;
-}
-
 interface RevisionSuggestion {
     explanation: string;
     replacement: string;
@@ -1565,39 +1562,11 @@ function parseRevisionSuggestion(text: string): RevisionSuggestion | undefined {
     return undefined;
 }
 
-function messageText(message: { content?: unknown }): string {
-    if (typeof message.content === "string") return message.content;
-    if (!Array.isArray(message.content)) return "";
-    return message.content
-        .filter((part): part is { type: "text"; text: string } =>
-            typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string")
-        .map((part) => part.text)
-        .join("\n");
-}
-
-function getTaskContext(ctx: ExtensionContext): string {
-    let userRequest = "";
-    let assistantIntent = "";
-
-    for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
-        if (entry.type !== "message") continue;
-        const message = entry.message;
-        if (!assistantIntent && message.role === "assistant") assistantIntent = messageText(message);
-        if (!userRequest && message.role === "user") userRequest = messageText(message);
-        if (userRequest && assistantIntent) break;
-    }
-
-    return [
-        userRequest ? `Current user request:\n${userRequest.slice(0, 2_000)}` : "",
-        assistantIntent ? `Main agent's stated intent:\n${assistantIntent.slice(0, 2_000)}` : "",
-    ].filter(Boolean).join("\n\n");
-}
-
 class SemanticReviewPanel implements Component {
     private mode: SemanticPanelMode = "menu";
     private selected = 0;
     private readonly input = new Input();
-    private readonly history: SemanticExchange[] = [];
+    private readonly messages: Array<UserMessage | AssistantMessage> = [];
     private suggestion?: RevisionSuggestion;
     private inputPurpose: "question" | "revision" = "question";
     private controller?: AbortController;
@@ -1610,6 +1579,7 @@ class SemanticReviewPanel implements Component {
         private readonly maxLines: number,
         private readonly requestRender: () => void,
         private readonly close: () => void,
+        private readonly activity: DiffReviewActivity,
     ) {
         this.input.onSubmit = (value) => {
             const guidance = value.trim();
@@ -1651,22 +1621,28 @@ class SemanticReviewPanel implements Component {
         this.controller = new AbortController();
         this.requestRender();
 
-        const priorReview = this.history
-            .map((exchange) => `Question: ${exchange.question}\nAnswer: ${exchange.answer}`)
-            .join("\n\n");
+        if (this.messages.length === 0) {
+            this.messages.push({
+                role: "user",
+                content: [{
+                    type: "text",
+                    text: `Main-task context:\n${extractRecentContext(this.ctx.sessionManager.getBranch()) || "No textual context available."}`,
+                }],
+                timestamp: Date.now(),
+            });
+        }
         const userMessage: UserMessage = {
             role: "user",
             content: [{
                 type: "text",
                 text: [
-                    getTaskContext(this.ctx),
                     codeContext,
-                    priorReview ? `Earlier review discussion:\n${priorReview}` : "",
                     `Question from the human reviewer:\n${question}`,
                 ].filter(Boolean).join("\n\n"),
             }],
             timestamp: Date.now(),
         };
+        this.messages.push(userMessage);
 
         try {
             const response = await this.ctx.modelRegistry.complete(
@@ -1675,11 +1651,19 @@ class SemanticReviewPanel implements Component {
                     systemPrompt: wantsRevision
                         ? "You are a review assistant inside a prospective diff viewer. Follow the human's revision guidance and propose the smallest useful replacement for only the proposed-side lines in the focused hunk. Return valid JSON only: {\"explanation\":\"brief reason\",\"replacement\":\"exact replacement text\"}. Preserve the project's language and style. Do not include Markdown fences. The human alone decides whether to use or approve it."
                         : "You are a language-agnostic review assistant inside a prospective diff viewer. Help the human understand syntax, intent, behavior, assumptions, and simpler alternatives in whatever language the project uses. You may advise, but only the human can approve or apply code. Use the supplied task and code context, be concrete, and keep the answer under eight short lines. Never claim the change has already been applied.",
-                    messages: [userMessage],
+                    messages: this.messages,
                 },
-                { signal: this.controller.signal, maxTokens: wantsRevision ? 1_000 : 500 },
+                {
+                    signal: this.controller.signal,
+                    maxTokens: wantsRevision ? 1_000 : 500,
+                    ...(this.ctx.thinkingLevel !== "off" ? { reasoning: this.ctx.thinkingLevel } : {}),
+                } as never,
             );
-            if (response.stopReason === "aborted") return;
+            if (response.stopReason === "aborted") {
+                this.messages.pop();
+                return;
+            }
+            this.messages.push(response);
             const answer = response.content
                 .filter((part): part is { type: "text"; text: string } => part.type === "text")
                 .map((part) => part.text)
@@ -1687,19 +1671,24 @@ class SemanticReviewPanel implements Component {
             if (wantsRevision) {
                 this.suggestion = parseRevisionSuggestion(answer);
                 if (this.suggestion) {
+                    this.activity.transcript.push({
+                        question,
+                        answer: `${this.suggestion.explanation}\n\nSuggested replacement:\n${this.suggestion.replacement}`,
+                    });
                     this.mode = "suggestion";
                 } else {
-                    this.history.push({ question, answer: "The reviewer did not return a valid structured revision. The candidate was not changed." });
+                    this.activity.transcript.push({ question, answer: "The reviewer did not return a valid structured revision. The candidate was not changed." });
                     this.mode = "answer";
                 }
             } else {
-                this.history.push({ question, answer: answer || "The reviewer returned no text." });
+                this.activity.transcript.push({ question, answer: answer || "The reviewer returned no text." });
                 this.mode = "answer";
             }
         } catch (error) {
+            this.messages.pop();
             if (this.controller.signal.aborted) return;
             const message = error instanceof Error ? error.message : String(error);
-            this.history.push({ question, answer: `Review failed: ${message}` });
+            this.activity.transcript.push({ question, answer: `Review failed: ${message}` });
             this.mode = "answer";
         } finally {
             this.controller = undefined;
@@ -1723,18 +1712,20 @@ class SemanticReviewPanel implements Component {
         }
         if (this.mode === "suggestion") {
             if (matchesKey(data, "escape")) {
+                this.activity.transcript.push({ question: "Revision decision", answer: "Discarded; the candidate was not changed." });
                 this.suggestion = undefined;
                 this.mode = "menu";
                 this.requestRender();
             }
             if (matchesKey(data, "return") && this.suggestion) {
                 const applied = this.viewer.applyCurrentHunkRevision(this.suggestion.replacement);
-                this.history.push({
-                    question: "Propose a guided revision",
+                this.activity.transcript.push({
+                    question: "Revision decision",
                     answer: applied
                         ? `${this.suggestion.explanation}\n\nAccepted into the in-memory candidate; final file approval is still required.`
                         : "This hunk could not be revised automatically. Use inline edit instead.",
                 });
+                if (applied) this.activity.candidateChanged = true;
                 this.suggestion = undefined;
                 this.mode = "answer";
                 this.requestRender();
@@ -1803,13 +1794,14 @@ class SemanticReviewPanel implements Component {
             body.push(...this.wrap(this.theme.fg("text", this.suggestion.replacement), innerWidth), "");
             body.push(this.theme.fg("dim", " Enter use in candidate • Esc discard"));
         } else {
-            for (const exchange of this.history) {
+            for (const exchange of this.activity.transcript) {
                 body.push(...this.wrap(this.theme.fg("accent", `Q: ${exchange.question}`), innerWidth));
                 body.push(...this.wrap(this.theme.fg("text", exchange.answer), innerWidth), "");
             }
             body.push(this.theme.fg("dim", " Enter ask another • Esc close"));
         }
 
+        while (body.length < this.maxLines - 2) body.push("");
         const visibleBody = body.slice(0, Math.max(1, this.maxLines - 2));
         const top = this.theme.fg("accent", `┌${"─".repeat(innerWidth)}┐`);
         const bottom = this.theme.fg("accent", `└${"─".repeat(innerWidth)}┘`);
@@ -1863,7 +1855,7 @@ async function showDiffHelp(ctx: ExtensionContext): Promise<void> {
     );
 }
 
-async function askAboutCurrentHunk(ctx: ExtensionContext, viewer: DiffViewer): Promise<void> {
+async function askAboutCurrentHunk(ctx: ExtensionContext, viewer: DiffViewer, activity: DiffReviewActivity): Promise<void> {
     if (!ctx.model) {
         ctx.ui.notify("Select a model before asking about a hunk.", "warning");
         return;
@@ -1875,7 +1867,7 @@ async function askAboutCurrentHunk(ctx: ExtensionContext, viewer: DiffViewer): P
 
     await ctx.ui.custom<void>(
         (tui, theme, _keybindings, done) =>
-            new SemanticReviewPanel(ctx, viewer, theme, Math.max(12, tui.terminal.rows - 4), () => tui.requestRender(), done),
+            new SemanticReviewPanel(ctx, viewer, theme, Math.max(12, tui.terminal.rows - 4), () => tui.requestRender(), done, activity),
         {
             overlay: true,
             overlayOptions: { anchor: "left-center", width: "30%", maxHeight: "90%", margin: 1 },
@@ -1901,6 +1893,7 @@ export async function reviewChangePreview(
     const expandedHeight = percentSizeValue(expandedHeightPercent);
     const expandedWidth = percentSizeValue(expandedWidthPercent);
     const kb = options.keybindings ?? DEFAULT_KEYBINDINGS;
+    const activity: DiffReviewActivity = { transcript: [], candidateChanged: false };
 
     const matchesBinding = (data: string, binding: string[] | false | undefined): boolean => {
         if (!binding) return false;
@@ -1916,6 +1909,20 @@ export async function reviewChangePreview(
         initialAfterText !== undefined && currentPreview.afterText !== undefined && currentPreview.afterText !== initialAfterText
             ? currentPreview.afterText
             : undefined;
+
+    const withActivity = (decision: DiffDecision): DiffDecision => {
+        const changed = decision.afterTextOverride !== undefined;
+        activity.candidateChanged ||= changed;
+        if (!activity.candidateChanged && activity.transcript.length === 0 && !activity.revisionRequest) return decision;
+        return {
+            ...decision,
+            reviewActivity: {
+                transcript: [...activity.transcript],
+                candidateChanged: activity.candidateChanged,
+                ...(activity.revisionRequest ? { revisionRequest: activity.revisionRequest } : {}),
+            },
+        };
+    };
 
     const syncCurrentPreviewFromViewer = (viewer: DiffViewer) => {
         const viewerPreview = viewer.getPreview();
@@ -1962,9 +1969,9 @@ export async function reviewChangePreview(
                 ],
             );
 
-            if (choice === approveLabel) return { action: "approve", afterTextOverride: getAfterTextOverride() };
+            if (choice === approveLabel) return withActivity({ action: "approve", afterTextOverride: getAfterTextOverride() });
             if (choice === approveAutoLabel) {
-                return { action: "approve_and_enable_auto", afterTextOverride: getAfterTextOverride() };
+                return withActivity({ action: "approve_and_enable_auto", afterTextOverride: getAfterTextOverride() });
             }
             if (choice === editFinalLabel && allowAfterEdit) {
                 const edited = await ctx.ui.editor(
@@ -1978,9 +1985,10 @@ export async function reviewChangePreview(
             }
             if (choice === steerLabel) {
                 const feedback = await ctx.ui.editor(t("ui.steerPrompt", "How should {path} change instead?", { path: currentPreview.path }), "");
-                return feedback?.trim() ? { action: "steer", feedback: feedback.trim() } : { action: "reject" };
+                if (feedback?.trim()) activity.revisionRequest = feedback.trim();
+                return withActivity(feedback?.trim() ? { action: "steer", feedback: feedback.trim() } : { action: "reject" });
             }
-            return { action: "reject" };
+            return withActivity({ action: "reject" });
         }
     }
 
@@ -2010,7 +2018,7 @@ export async function reviewChangePreview(
                             return;
                         }
                         if (data === "r") {
-                            void askAboutCurrentHunk(ctx, viewer);
+                            void askAboutCurrentHunk(ctx, viewer, activity);
                             return;
                         }
                         if (matchesBinding(data, kb.approve)) {
@@ -2018,11 +2026,13 @@ export async function reviewChangePreview(
                             return;
                         }
                         if (matchesBinding(data, kb.reject)) {
-                            done({ action: "reject" });
+                            syncCurrentPreviewFromViewer(viewer);
+                            done({ action: "reject", afterTextOverride: getAfterTextOverride() });
                             return;
                         }
                         if (matchesBinding(data, kb.steer)) {
-                            done({ action: "steer" });
+                            syncCurrentPreviewFromViewer(viewer);
+                            done({ action: "steer", afterTextOverride: getAfterTextOverride() });
                             return;
                         }
                         if (matchesBinding(data, kb.autoApprove)) {
@@ -2049,9 +2059,10 @@ export async function reviewChangePreview(
             },
         );
 
-        if (decision.action !== "steer") return decision;
+        if (decision.action !== "steer") return withActivity(decision);
         const feedback = await ctx.ui.editor(t("ui.steerPrompt", "How should {path} change instead?", { path: preview.path }), "");
-        return feedback?.trim() ? { action: "steer", feedback: feedback.trim() } : { action: "reject" };
+        if (feedback?.trim()) activity.revisionRequest = feedback.trim();
+        return withActivity(feedback?.trim() ? { action: "steer", feedback: feedback.trim() } : { action: "reject" });
     }
 
     // Expandable layout: non-overlay compact, Ctrl+F stacks full overlay on top.
@@ -2117,7 +2128,7 @@ export async function reviewChangePreview(
                                     return;
                                 }
                                 if (data === "r") {
-                                    void askAboutCurrentHunk(ctx, oViewer);
+                                    void askAboutCurrentHunk(ctx, oViewer, activity);
                                     return;
                                 }
                                 if (matchesBinding(data, kb.toggleExpand)) {
@@ -2130,11 +2141,13 @@ export async function reviewChangePreview(
                                     return;
                                 }
                                 if (matchesBinding(data, kb.reject)) {
-                                    oDone({ action: "reject" });
+                                    syncCurrentPreviewFromViewer(oViewer);
+                                    oDone({ action: "reject", afterTextOverride: getAfterTextOverride() });
                                     return;
                                 }
                                 if (matchesBinding(data, kb.steer)) {
-                                    oDone({ action: "steer" });
+                                    syncCurrentPreviewFromViewer(oViewer);
+                                    oDone({ action: "steer", afterTextOverride: getAfterTextOverride() });
                                     return;
                                 }
                                 if (matchesBinding(data, kb.autoApprove)) {
@@ -2188,7 +2201,7 @@ export async function reviewChangePreview(
                         return;
                     }
                     if (data === "r") {
-                        void askAboutCurrentHunk(ctx, viewer);
+                        void askAboutCurrentHunk(ctx, viewer, activity);
                         return;
                     }
                     if (matchesBinding(data, kb.toggleExpand)) {
@@ -2200,11 +2213,13 @@ export async function reviewChangePreview(
                         return;
                     }
                     if (matchesBinding(data, kb.reject)) {
-                        done({ action: "reject" });
+                        syncCurrentPreviewFromViewer(viewer);
+                        done({ action: "reject", afterTextOverride: getAfterTextOverride() });
                         return;
                     }
                     if (matchesBinding(data, kb.steer)) {
-                        done({ action: "steer" });
+                        syncCurrentPreviewFromViewer(viewer);
+                        done({ action: "steer", afterTextOverride: getAfterTextOverride() });
                         return;
                     }
                     if (matchesBinding(data, kb.autoApprove)) {
@@ -2225,7 +2240,8 @@ export async function reviewChangePreview(
         },
     );
 
-    if (decision.action !== "steer") return decision;
+    if (decision.action !== "steer") return withActivity(decision);
     const feedback = await ctx.ui.editor(t("ui.steerPrompt", "How should {path} change instead?", { path: preview.path }), "");
-    return feedback?.trim() ? { action: "steer", feedback: feedback.trim() } : { action: "reject" };
+    if (feedback?.trim()) activity.revisionRequest = feedback.trim();
+    return withActivity(feedback?.trim() ? { action: "steer", feedback: feedback.trim() } : { action: "reject" });
 }

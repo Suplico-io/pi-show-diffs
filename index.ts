@@ -2,15 +2,17 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { SettingsList, truncateToWidth, type SettingItem } from "@earendil-works/pi-tui";
+import { SettingsList, Text, truncateToWidth, type SettingItem } from "@earendil-works/pi-tui";
 
 import { CONFIG_PATH, DEFAULT_KEYBINDINGS, loadConfig, normalizeConfig, saveConfig, type DiffApprovalConfig, type DiffColorMode, type DiffKeybindings } from "./src/config.js";
 import { detectLineEnding, generateDiffString, restoreLineEndings, stripBom } from "./src/diff-utils.js";
 import { computeChangePreview, type ChangePreview, type PreviewToolName } from "./src/preview.js";
 import { reviewChangePreview } from "./src/ui.js";
 import { initI18n, t } from "./src/i18n.js";
+import { createReviewReceipt, receiptContent, type ActionReviewReceiptV1 } from "./src/review-session.js";
 
 const STATUS_KEY = "pi-show-diffs";
+const RECEIPT_TYPE = "pi-atomic-diffs.receipt";
 const TOOL_CALL_REVIEWED_TOOLS = new Set<PreviewToolName>(["edit", "hashline_edit", "write"]);
 
 interface PendingImmediateApply {
@@ -22,6 +24,17 @@ export default function showDiffsExtension(pi: ExtensionAPI) {
 	initI18n(pi);
 	let config = loadConfig();
 	const pendingImmediateApplies = new Map<string, PendingImmediateApply>();
+
+	pi.registerMessageRenderer(RECEIPT_TYPE, (message, { expanded }, theme) => {
+		const details = message.details as ActionReviewReceiptV1 | undefined;
+		const lines = [theme.bold(theme.fg("accent", "File review receipt")), message.content];
+		if (expanded && details) {
+			for (const exchange of details.transcript) {
+				lines.push("", theme.fg("accent", `You: ${exchange.question}`), exchange.answer);
+			}
+		}
+		return new Text(lines.join("\n"), 0, 0);
+	});
 
 	function refreshConfig() {
 		config = loadConfig();
@@ -342,22 +355,6 @@ export default function showDiffsExtension(pi: ExtensionAPI) {
 			: `Rejected by user after diff review for ${preview.path}.`;
 	}
 
-	function sendSteerFeedback(preview: ChangePreview, feedback?: string) {
-		if (!feedback) return;
-		try {
-			pi.sendUserMessage(
-				[
-					`I rejected the proposed ${preview.toolName} change to ${preview.path}.`,
-					`Please revise it like this:\n${feedback}`,
-					"Do not retry the same file change unchanged.",
-				].join("\n\n"),
-				{ deliverAs: "steer" },
-			);
-		} catch {
-			// Best-effort; the block reason still gives the model useful context.
-		}
-	}
-
 	function queuePendingImmediateApply(toolCallId: string, preview: ChangePreview, afterText: string) {
 		pendingImmediateApplies.set(toolCallId, { preview, afterText });
 	}
@@ -367,21 +364,6 @@ export default function showDiffsExtension(pi: ExtensionAPI) {
 		if (!pending) return undefined;
 		pendingImmediateApplies.delete(toolCallId);
 		return pending;
-	}
-
-	function sendNoChangeFeedback(preview: ChangePreview) {
-		try {
-			pi.sendUserMessage(
-				[
-					`I decided ${preview.path} should stay unchanged.`,
-					"Do not retry the previous file change.",
-					"Continue with the rest of the task if needed.",
-				].join("\n\n"),
-				{ deliverAs: "steer" },
-			);
-		} catch {
-			// Best-effort; the block reason still gives the model useful context.
-		}
 	}
 
 	function shouldSkipReview(preview: ChangePreview) {
@@ -461,15 +443,37 @@ export default function showDiffsExtension(pi: ExtensionAPI) {
 			keybindings: config.keybindings,
 		});
 
+		if (decision.reviewActivity) {
+			const keptExisting = decision.afterTextOverride !== undefined
+				&& preview.beforeText !== undefined
+				&& decision.afterTextOverride === preview.beforeText;
+			const disposition: ActionReviewReceiptV1["disposition"] = decision.action === "steer"
+				? "revision-requested"
+				: decision.action === "reject" || keptExisting
+					? "rejected"
+					: decision.afterTextOverride !== undefined
+						? "revised"
+						: "approved";
+			const receipt = createReviewReceipt({
+				path: preview.path,
+				tool: preview.toolName,
+				beforeText: preview.beforeText ?? "",
+				afterText: decision.afterTextOverride ?? preview.afterText ?? "",
+				disposition,
+				activity: decision.reviewActivity,
+			});
+			pi.sendMessage(
+				{ customType: RECEIPT_TYPE, content: receiptContent(receipt), display: true, details: receipt },
+				{ deliverAs: "steer" },
+			);
+		}
+
 		if (decision.action === "approve_and_enable_auto") {
 			setAutoApprove(true, ctx);
 		}
 
 		if (decision.action === "reject" || decision.action === "steer") {
 			const feedback = decision.action === "steer" ? decision.feedback?.trim() : undefined;
-			if (decision.action === "steer") {
-				sendSteerFeedback(preview, feedback);
-			}
 			return {
 				block: true,
 				reason: getRejectionReason(preview, feedback),
@@ -478,7 +482,6 @@ export default function showDiffsExtension(pi: ExtensionAPI) {
 
 		if (decision.afterTextOverride !== undefined) {
 			if (preview.beforeText !== undefined && decision.afterTextOverride === preview.beforeText) {
-				sendNoChangeFeedback(preview);
 				return {
 					block: true,
 					reason: `No changes were applied to ${preview.path}; user kept the existing file contents.`,
