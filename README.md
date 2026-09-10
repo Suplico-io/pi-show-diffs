@@ -18,6 +18,8 @@ Press `r` while reviewing a structured diff to open a conversation panel beside 
 
 A guided revision first asks what you want improved, then shows the smallest suggested replacement in the panel. Enter accepts it into the in-memory candidate and updates the diff; Esc discards it. The final file still requires normal human approval. If the candidate changes before approval, the main agent's tool result explicitly reports that the reviewed version—not its original proposal—was applied.
 
+Guided revision tolerates structured JSON wrapped in ordinary model prose or Markdown fences. If the first response is malformed, it makes one automatic formatting retry. If that also fails, the panel shows a bounded excerpt of the actual response and leaves the candidate untouched.
+
 When discussion, inline editing, or revision guidance materially affects the review, the main session receives a concise review receipt. Expanding that custom message shows the complete local exchange; the model-visible content contains only the outcome and actionable instruction.
 
 The receipt uses the same `ActionReviewReceiptV1` envelope documented by `pi-dcg-review`: artifact label and content digests, deterministic trigger metadata, disposition, concise summary, full transcript, and revision metadata. Each package implements the convention independently so neither is a runtime dependency of the other.

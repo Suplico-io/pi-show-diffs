@@ -27,6 +27,7 @@ import { DEFAULT_KEYBINDINGS, type DiffColorMode, type DiffKeybindings } from ".
 import { rebuildPreviewAfterManualEdit, type ChangePreview } from "./preview.js";
 import { detectSyntaxLanguage, tokenizeSyntaxLine, type SyntaxSegment } from "./syntax-highlight.js";
 import { extractRecentContext, type DiffReviewActivity } from "./review-session.js";
+import { parseRevisionSuggestion, revisionFailureMessage, type RevisionSuggestion } from "./revision-suggestion.js";
 
 export interface DiffDecision {
     action: "approve" | "reject" | "steer" | "approve_and_enable_auto";
@@ -1546,20 +1547,11 @@ const SEMANTIC_ACTIONS = [
 
 type SemanticPanelMode = "menu" | "custom" | "loading" | "answer" | "suggestion";
 
-interface RevisionSuggestion {
-    explanation: string;
-    replacement: string;
-}
-
-function parseRevisionSuggestion(text: string): RevisionSuggestion | undefined {
-    const unfenced = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-    try {
-        const parsed = JSON.parse(unfenced) as Partial<RevisionSuggestion>;
-        if (typeof parsed.explanation === "string" && typeof parsed.replacement === "string") {
-            return { explanation: parsed.explanation, replacement: parsed.replacement };
-        }
-    } catch {}
-    return undefined;
+function assistantText(message: AssistantMessage): string {
+    return message.content
+        .filter((part): part is { type: "text"; text: string } => part.type === "text")
+        .map((part) => part.text)
+        .join("\n");
 }
 
 class SemanticReviewPanel implements Component {
@@ -1645,31 +1637,60 @@ class SemanticReviewPanel implements Component {
         this.messages.push(userMessage);
 
         try {
+            const systemPrompt = wantsRevision
+                ? "You are a review assistant inside a prospective diff viewer. Follow the human's revision guidance and propose the smallest useful replacement for only the proposed-side lines in the focused hunk. Return valid JSON only: {\"explanation\":\"brief reason\",\"replacement\":\"exact replacement text\"}. Preserve the project's language and style. Do not include Markdown fences. The human alone decides whether to use or approve it."
+                : "You are a language-agnostic review assistant inside a prospective diff viewer. Help the human understand syntax, intent, behavior, assumptions, and simpler alternatives in whatever language the project uses. You may advise, but only the human can approve or apply code. Use the supplied task and code context, be concrete, and keep the answer under eight short lines. Never claim the change has already been applied.";
+            const completionOptions = {
+                signal: this.controller.signal,
+                maxTokens: wantsRevision ? 1_000 : 500,
+                ...(this.ctx.thinkingLevel !== "off" ? { reasoning: this.ctx.thinkingLevel } : {}),
+            } as never;
             const response = await this.ctx.modelRegistry.complete(
                 this.ctx.model,
                 {
-                    systemPrompt: wantsRevision
-                        ? "You are a review assistant inside a prospective diff viewer. Follow the human's revision guidance and propose the smallest useful replacement for only the proposed-side lines in the focused hunk. Return valid JSON only: {\"explanation\":\"brief reason\",\"replacement\":\"exact replacement text\"}. Preserve the project's language and style. Do not include Markdown fences. The human alone decides whether to use or approve it."
-                        : "You are a language-agnostic review assistant inside a prospective diff viewer. Help the human understand syntax, intent, behavior, assumptions, and simpler alternatives in whatever language the project uses. You may advise, but only the human can approve or apply code. Use the supplied task and code context, be concrete, and keep the answer under eight short lines. Never claim the change has already been applied.",
+                    systemPrompt,
                     messages: this.messages,
                 },
-                {
-                    signal: this.controller.signal,
-                    maxTokens: wantsRevision ? 1_000 : 500,
-                    ...(this.ctx.thinkingLevel !== "off" ? { reasoning: this.ctx.thinkingLevel } : {}),
-                } as never,
+                completionOptions,
             );
             if (response.stopReason === "aborted") {
                 this.messages.pop();
                 return;
             }
             this.messages.push(response);
-            const answer = response.content
-                .filter((part): part is { type: "text"; text: string } => part.type === "text")
-                .map((part) => part.text)
-                .join("\n");
+            let answer = assistantText(response);
             if (wantsRevision) {
                 this.suggestion = parseRevisionSuggestion(answer);
+                let retryError: string | undefined;
+                if (!this.suggestion) {
+                    this.messages.push({
+                        role: "user",
+                        content: [{
+                            type: "text",
+                            text: "Your response could not be read as the requested revision object. Return the same proposal again as one JSON object with exactly two string fields, explanation and replacement. Output JSON only, with all newlines inside replacement correctly escaped.",
+                        }],
+                        timestamp: Date.now(),
+                    });
+                    try {
+                        const repairedResponse = await this.ctx.modelRegistry.complete(
+                            this.ctx.model,
+                            { systemPrompt, messages: this.messages },
+                            completionOptions,
+                        );
+                        if (repairedResponse.stopReason === "aborted") {
+                            this.messages.pop();
+                            return;
+                        }
+                        this.messages.push(repairedResponse);
+                        const repairedAnswer = assistantText(repairedResponse);
+                        this.suggestion = parseRevisionSuggestion(repairedAnswer);
+                        answer = repairedAnswer || answer;
+                    } catch (error) {
+                        this.messages.pop();
+                        if (this.controller.signal.aborted) return;
+                        retryError = error instanceof Error ? error.message : String(error);
+                    }
+                }
                 if (this.suggestion) {
                     this.activity.transcript.push({
                         question,
@@ -1677,7 +1698,7 @@ class SemanticReviewPanel implements Component {
                     });
                     this.mode = "suggestion";
                 } else {
-                    this.activity.transcript.push({ question, answer: "The reviewer did not return a valid structured revision. The candidate was not changed." });
+                    this.activity.transcript.push({ question, answer: revisionFailureMessage(answer, retryError) });
                     this.mode = "answer";
                 }
             } else {
